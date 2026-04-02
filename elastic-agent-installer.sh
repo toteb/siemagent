@@ -110,7 +110,13 @@ BASE_URL="https://artifacts.elastic.co/downloads/beats/elastic-agent"
 FILE="elastic-agent-${VERSION}-${PKG}"
 
 # Download to /tmp
-curl -L -o "/tmp/${FILE}" "${BASE_URL}/${FILE}"
+if command -v curl >/dev/null 2>&1; then
+    curl -L -o "/tmp/${FILE}" "${BASE_URL}/${FILE}"
+elif command -v wget >/dev/null 2>&1; then
+    wget -O "/tmp/${FILE}" "${BASE_URL}/${FILE}"
+else
+    error_exit "Neither curl nor wget is available. Please install one of them."
+fi
 
 if [[ "$OS" == "debian" ]]; then
     dpkg -i "/tmp/${FILE}"
