@@ -124,7 +124,13 @@ $recheckDelaySeconds = 15
 
 # Longest the deployment may run before it is stopped (a hung deployment would otherwise block
 # the confirmation check and the status report forever).
-$deployTimeoutMinutes = 10
+$deployTimeoutMinutes = 15
+
+# Elastic Agent listens on 127.0.0.1:<agent.grpc.port> for its own components. The default is 6789,
+# which other software (e.g. the UniFi Network Application) also uses. If it is taken or not bindable,
+# the agent service dies right after it starts and the installer fails with "elastic-agent-system pipe
+# not found". The deployment then picks another port and writes it into elastic-agent.yml.
+$defaultAgentGrpcPort = 6789
 ####################################################
 
 ######## Uncomment if you want to have hard-coded fleeturl and token variables ##########
@@ -228,6 +234,55 @@ function Format-ElasticInstallOutput {
     }
 }
 
+# Lists the processes that are listening on a TCP port (any address, IPv4 or IPv6), one readable string
+# each. Parses netstat so it works on every Windows version the script supports. Never throws.
+function Get-PortListener {
+    param ([int]$Port)
+    $found = @()
+    try {
+        foreach ($line in (netstat.exe -ano 2>$null)) {
+            if ($line -match "^\s*TCP\s+(\S+):${Port}\s+\S+\s+LISTENING\s+(\d+)\s*$") {
+                $address = $Matches[1]
+                $listenerPid = [int]$Matches[2]
+                $proc = Get-WmiObject -Class Win32_Process -Filter "ProcessId=$listenerPid" -ErrorAction SilentlyContinue
+                $found += "PID $listenerPid $($proc.Name) [$($proc.ExecutablePath)] on ${address}:${Port}"
+            }
+        }
+    } catch { }
+    return $found
+}
+
+# True when 127.0.0.1:<Port> can actually be bound right now. This is the same operation the agent
+# performs, so it also catches ports Windows refuses without a visible listener (excluded port ranges
+# reserved by Hyper-V/WinNAT, exclusive binds by another process).
+function Test-PortBindable {
+    param ([int]$Port)
+    $listener = $null
+    try {
+        $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
+        $listener.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($listener) { try { $listener.Stop() } catch { } }
+    }
+}
+
+# Returns the first usable port for the agent's local gRPC listener: the default when it is free,
+# otherwise the first free one in 6790-6890. Ports in -Exclude (already tried) are skipped.
+# Returns $null when nothing is usable.
+function Find-FreeAgentGrpcPort {
+    param ([int[]]$Exclude = @())
+    foreach ($candidate in (@($defaultAgentGrpcPort) + (6790..6890))) {
+        if ($Exclude -contains $candidate) { continue }
+        if (@(Get-PortListener -Port $candidate).Count -gt 0) { continue }
+        if (-not (Test-PortBindable -Port $candidate)) { continue }
+        return $candidate
+    }
+    return $null
+}
+
 # Prints what is known about a failed deployment: service state, whether the Fleet server answers,
 # Windows service-start errors and the agent's own recent errors. Read-only, and never throws.
 function Write-SiemDiagnostics {
@@ -238,6 +293,15 @@ function Write-SiemDiagnostics {
         if ($services.Count -eq 0) { Write-Output "Services: none installed (the failed install was rolled back or never started)" }
         foreach ($service in $services) { Write-Output "Service '$($service.Name)': $($service.Status)" }
     } catch { Write-Output "Services: could not be read ($($_.Exception.Message))" }
+
+    try {
+        $listeners = @(Get-PortListener -Port $defaultAgentGrpcPort)
+        if ($listeners.Count -gt 0) {
+            foreach ($listener in $listeners) { Write-Output "Port ${defaultAgentGrpcPort} (agent default) is in use: $listener" }
+        } elseif (-not (Test-PortBindable -Port $defaultAgentGrpcPort)) {
+            Write-Output "Port ${defaultAgentGrpcPort} (agent default) has no listener but cannot be bound (Windows excluded port range or a security product)"
+        }
+    } catch { }
 
     try {
         $fleetUri = [uri](($fleetURL -join '').Trim())
@@ -283,7 +347,8 @@ function Write-SiemDiagnostics {
     } catch { }
 
     try {
-        $logFile = Get-ChildItem -Path "$env:ProgramFiles\Elastic\Agent\data\*\logs\*.ndjson" -ErrorAction SilentlyContinue |
+        # the live log, or the copy the deployment saved before the installer's rollback deleted it
+        $logFile = Get-ChildItem -Path "$env:ProgramFiles\Elastic\Agent\data\*\logs\*.ndjson", (Join-Path $env:TEMP "UNSAgent-failure-logs\*.ndjson") -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
         if ($logFile) {
             $errors = @(Get-Content -Path $logFile.FullName -Tail 300 -ErrorAction SilentlyContinue | Where-Object { $_ -match '"log.level":"error"' } | Select-Object -Last 6)
@@ -979,6 +1044,19 @@ foreach ($i in 0..($agentPaths.Length - 1)) {
 Write-Output "$(Get-FormattedDate) Downloading required deployment files, please be patient."
 # Function to download files from the internet
 function Get-UNSFiles($downloadUrl, $installPath) {
+    # A file left behind (or still locked) by an earlier run makes every download method below fail
+    # with "being used by another process". Clear it first, and stop with a clear message if it is locked.
+    if (Test-Path -LiteralPath $installPath) {
+        for ($wait = 0; $wait -lt 5; $wait++) {
+            try { Remove-Item -LiteralPath $installPath -Force -ErrorAction Stop; break }
+            catch { Start-Sleep -Seconds 1 }
+        }
+        if (Test-Path -LiteralPath $installPath) {
+            Write-Error "$(Get-FormattedDate) $installPath is locked by another process and cannot be replaced. Stop whatever holds it (a previous deployment, an antivirus scan) or delete it, then run again."
+            exit 1
+        }
+    }
+
     $retryCount = 0
     do {
         try {
@@ -988,13 +1066,18 @@ function Get-UNSFiles($downloadUrl, $installPath) {
             $downloadSuccessful = $true
         }
         catch {
-            Write-Error "$(Get-FormattedDate) Asynchronous download failed. Trying synchronous download."
+            $asyncReason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+            Write-Error "$(Get-FormattedDate) Asynchronous download failed ($asyncReason). Trying synchronous download."
+            # the failed async download can keep the target file open; use a fresh client for the retry
+            try { $webClient.Dispose() } catch { }
+            $webClient = New-Object System.Net.WebClient
             try {
                 $webClient.DownloadFile($downloadUrl, $installPath)
                 $downloadSuccessful = $true
             }
             catch {
-                Write-Error "$(Get-FormattedDate) Synchronous download failed. Trying Invoke-WebRequest."
+                Write-Error "$(Get-FormattedDate) Synchronous download failed ($($_.Exception.Message)). Trying Invoke-WebRequest."
+                try { $webClient.Dispose() } catch { }
                 try {
                     Invoke-WebRequest -Uri $downloadUrl -OutFile $installPath -UseBasicParsing
                     while (!(Test-Path $installPath) -or (Get-Item $installPath).length -eq 0) {
@@ -1013,9 +1096,11 @@ function Get-UNSFiles($downloadUrl, $installPath) {
         }
     } while (-not $downloadSuccessful -and $retryCount -lt 3)
 
+    if ($webClient) { try { $webClient.Dispose() } catch { } }
+
     if (-not $downloadSuccessful) {
         Write-Error "$(Get-FormattedDate) Failed to download files after 3 attempts"
-        exit
+        exit 1
     }
 }
 
@@ -1544,6 +1629,205 @@ function Remove-ExistingElasticAgent {
     Write-Output "$(Get-FormattedDate) Old agent/endpoint services removed, deploying UNS SIEM Agent"
 }
 
+# Sets agent.grpc.port in an elastic-agent.yml. Any existing agent.grpc setting (block or dotted key)
+# is replaced, everything else in the file is left as it is, and the original is kept once as
+# <file>.uns-bak. Returns $true when the file was written.
+function Set-AgentGrpcPort {
+    param ([string]$ConfigPath, [int]$Port)
+
+    if (-not (Test-Path -LiteralPath $ConfigPath)) { return $false }
+    try {
+        $backup = "$ConfigPath.uns-bak"
+        if (-not (Test-Path -LiteralPath $backup)) { Copy-Item -LiteralPath $ConfigPath -Destination $backup -Force }
+
+        $kept = New-Object System.Collections.Generic.List[string]
+        $skipping = $false
+        $pending = New-Object System.Collections.Generic.List[string]   # comment/blank lines seen inside a block being replaced
+        foreach ($line in [System.IO.File]::ReadAllLines($ConfigPath)) {
+            if ($line -match '^agent\.grpc(\.[A-Za-z_]+)?\s*:') { $skipping = $true; $pending.Clear(); continue }
+            if ($skipping) {
+                if ($line -match '^\s*(#.*)?$') { $pending.Add($line); continue }   # comment or blank: may sit inside the block
+                if ($line -match '^\s+\S') { $pending.Clear(); continue }           # indented content of the old block (comments before it go too)
+                $skipping = $false                                                  # next top-level key: the block is over
+                foreach ($held in $pending) { $kept.Add($held) }
+                $pending.Clear()
+            }
+            $kept.Add($line)
+        }
+        foreach ($held in $pending) { $kept.Add($held) }   # file ended while still in the block
+        $kept.Add("agent.grpc:")
+        $kept.Add("  address: localhost")
+        $kept.Add("  port: $Port")
+        [System.IO.File]::WriteAllLines($ConfigPath, $kept, (New-Object System.Text.UTF8Encoding($false)))
+        return $true
+    } catch {
+        Write-Verbose "$(Get-FormattedDate) Could not update $ConfigPath : $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Copies the agent's own logs to a folder that survives the deployment cleanup. The installer's rollback
+# deletes them, and they are the only place that says why the service died.
+function Save-AgentFailureLogs {
+    $destination = Join-Path $env:TEMP "UNSAgent-failure-logs"
+    try {
+        New-Item -Path $destination -ItemType Directory -Force | Out-Null
+        $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        foreach ($file in @(Get-ChildItem -Path "$env:ProgramFiles\Elastic\Agent\data\elastic-agent-*\logs\*" -File -ErrorAction SilentlyContinue)) {
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $destination "$stamp-$($file.Name)") -Force -ErrorAction SilentlyContinue
+        }
+        $installedYml = Join-Path $env:ProgramFiles "Elastic\Agent\elastic-agent.yml"
+        if (Test-Path -LiteralPath $installedYml) { Copy-Item -LiteralPath $installedYml -Destination (Join-Path $destination "$stamp-elastic-agent.yml") -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    return $destination
+}
+
+# Returns the agent's most recent error messages from its live log (empty when there is none).
+function Get-AgentLogErrors {
+    param ([int]$Count = 6)
+    $messages = @()
+    try {
+        $logFile = Get-ChildItem -Path "$env:ProgramFiles\Elastic\Agent\data\elastic-agent-*\logs\*.ndjson" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($logFile) {
+            foreach ($errorLine in @(Get-Content -Path $logFile.FullName -Tail 300 -ErrorAction SilentlyContinue | Where-Object { $_ -match '"log.level":"error"' } | Select-Object -Last $Count)) {
+                try { $messages += ($errorLine | ConvertFrom-Json -ErrorAction Stop).message } catch { $messages += $errorLine }
+            }
+        }
+    } catch { }
+    return $messages
+}
+
+# True once the Elastic Agent service has been running continuously for the given time. Returns $false
+# as soon as it stops after having started (the symptom of the port problem), or if it never starts.
+function Wait-AgentServiceStable {
+    param ([int]$Seconds = 30)
+    $started = Get-Date
+    $deadline = $started.AddSeconds($Seconds)
+    $sawRunning = $false
+    while ((Get-Date) -lt $deadline) {
+        $service = Get-Service -Name "Elastic Agent" -ErrorAction SilentlyContinue
+        if (-not $service) { return $false }
+        if ($service.Status -eq 'Running') { $sawRunning = $true }
+        elseif ($sawRunning -or (((Get-Date) - $started).TotalSeconds -gt 15)) { return $false }
+        Start-Sleep -Seconds 2
+    }
+    $service = Get-Service -Name "Elastic Agent" -ErrorAction SilentlyContinue
+    return ($sawRunning -and $service -and ($service.Status -eq 'Running'))
+}
+
+# Runs elastic-agent install and captures its output without the progress spinner. The result is left in
+# $script:InstallResult (ExitCode, Text) so nothing else ends up in the function's output.
+function Invoke-ElasticAgentInstallProcess {
+    param ([string]$ExePath, [string]$Arguments)
+
+    $installOutFile = Join-Path $env:TEMP "uns-elastic-install-out.txt"
+    $installErrFile = Join-Path $env:TEMP "uns-elastic-install-err.txt"
+    Remove-Item -Path $installOutFile, $installErrFile -Force -ErrorAction SilentlyContinue
+    $process = Start-Process -FilePath $ExePath -ArgumentList $Arguments -NoNewWindow -PassThru -RedirectStandardOutput $installOutFile -RedirectStandardError $installErrFile
+    $handle = $process.Handle  # Cache the process handle so ExitCode is readable after WaitForExit
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+    $null = $handle
+
+    Write-Output "$(Get-FormattedDate) elastic-agent install finished with exit code $exitCode. Installer output:"
+    Format-ElasticInstallOutput $installOutFile
+    if ((Test-Path $installErrFile) -and ((Get-Item $installErrFile).Length -gt 0)) {
+        Write-Output "    Installer error output:"
+        Format-ElasticInstallOutput $installErrFile
+    }
+    $text = ((Get-Content -Path $installOutFile -Raw -ErrorAction SilentlyContinue) + "`n" + (Get-Content -Path $installErrFile -Raw -ErrorAction SilentlyContinue))
+    Remove-Item -Path $installOutFile, $installErrFile -Force -ErrorAction SilentlyContinue
+    $script:InstallResult = [pscustomobject]@{ ExitCode = $exitCode; Text = $text }
+}
+
+# Installs the agent and recovers from a service that dies right after it starts:
+#   1. Pre-flight: if the default local port (6789) is listened on or cannot be bound, a free one is chosen
+#      and written into the package's elastic-agent.yml before installing.
+#   2. Normal install. If it works, done.
+#   3. If it fails, the installer has rolled everything back and its logs are gone. Install again with
+#      --delay-enroll, which does not roll back, so the service can be started and the logs read. If the
+#      service dies again and the logs (or the port itself) point at the port, the next free port is
+#      written into the installed elastic-agent.yml and the service is restarted (up to 3 times).
+# Returns $true when an agent service is installed and stays running.
+function Invoke-ElasticAgentInstallWithRecovery {
+    param ([string]$PackageDir, [string]$BaseArguments)
+
+    $exe = Join-Path $PackageDir "elastic-agent.exe"
+    $packageYml = Join-Path $PackageDir "elastic-agent.yml"
+    $installedYml = Join-Path $env:ProgramFiles "Elastic\Agent\elastic-agent.yml"
+    $portPattern = 'bind:|forbidden by its access permissions|only one usage of each socket|address already in use|elastic-agent-system|could not reload agent'
+    $triedPorts = @()
+
+    # 1. Pre-flight
+    $port = Find-FreeAgentGrpcPort
+    if ($null -eq $port) {
+        Write-Output "$(Get-FormattedDate) No free local port found for the agent, installing with the default $defaultAgentGrpcPort"
+        $port = $defaultAgentGrpcPort
+    } elseif ($port -ne $defaultAgentGrpcPort) {
+        foreach ($listener in @(Get-PortListener -Port $defaultAgentGrpcPort)) { Write-Output "$(Get-FormattedDate) Default agent port $defaultAgentGrpcPort is in use: $listener" }
+        if (@(Get-PortListener -Port $defaultAgentGrpcPort).Count -eq 0) { Write-Output "$(Get-FormattedDate) Default agent port $defaultAgentGrpcPort cannot be bound" }
+        if (Set-AgentGrpcPort -ConfigPath $packageYml -Port $port) {
+            Write-Output "$(Get-FormattedDate) Agent will use local port $port (agent.grpc.port written to the package elastic-agent.yml)"
+        } else {
+            Write-Output "$(Get-FormattedDate) Could not write agent.grpc.port to $packageYml"
+        }
+    } else {
+        Write-Verbose "$(Get-FormattedDate) Local port $defaultAgentGrpcPort is free"
+    }
+    $triedPorts += $port
+
+    # 2. Normal install
+    Invoke-ElasticAgentInstallProcess -ExePath $exe -Arguments "$BaseArguments --enroll-timeout=2m"
+    if ($script:InstallResult.ExitCode -eq 0) { $script:AgentInstallOk = $true; return }
+
+    # 3. Recovery
+    $portRelated = ($script:InstallResult.Text -match $portPattern)
+    Write-Output "$(Get-FormattedDate) Install failed$(if ($portRelated) { ' with an error that points at the agent port or its startup' }). Retrying with delayed enrollment so the failure logs are kept"
+    if ($portRelated) {
+        $next = Find-FreeAgentGrpcPort -Exclude $triedPorts
+        if ($null -ne $next) {
+            if (Set-AgentGrpcPort -ConfigPath $packageYml -Port $next) {
+                Write-Output "$(Get-FormattedDate) Switching the agent to local port $next"
+                $port = $next
+                $triedPorts += $next
+            }
+        }
+    }
+
+    Invoke-ElasticAgentInstallProcess -ExePath $exe -Arguments "$BaseArguments --delay-enroll"
+    if ($script:InstallResult.ExitCode -ne 0) { $script:AgentInstallOk = $false; return }
+
+    for ($try = 1; $try -le 3; $try++) {
+        if (-not (Get-Service -Name "Elastic Agent" -ErrorAction SilentlyContinue)) { $script:AgentInstallOk = $false; return }
+        try { Start-Service -Name "Elastic Agent" -ErrorAction Stop } catch { Write-Output "$(Get-FormattedDate) Start-Service: $($_.Exception.Message)" }
+        if (Wait-AgentServiceStable -Seconds 30) {
+            Write-Output "$(Get-FormattedDate) Agent service is running (local port $port)"
+            $script:AgentInstallOk = $true; return
+        }
+
+        Write-Output "$(Get-FormattedDate) Agent service did not stay running (start attempt $try of 3)"
+        $logDir = Save-AgentFailureLogs
+        $agentErrors = @(Get-AgentLogErrors)
+        foreach ($agentError in $agentErrors) { Write-Output "    Agent log error: $agentError" }
+        Write-Output "    Agent logs saved to $logDir"
+        try { Stop-Service -Name "Elastic Agent" -Force -ErrorAction SilentlyContinue } catch { }
+
+        $bindProblem = (($agentErrors -join "`n") -match $portPattern) -or (-not (Test-PortBindable -Port $port))
+        if (-not $bindProblem) {
+            Write-Output "    The logs do not point at the port, so another port will not help. See the saved logs (antivirus/EDR blocking elastic-agent.exe is the next thing to check)."
+            $script:AgentInstallOk = $false; return
+        }
+        $next = Find-FreeAgentGrpcPort -Exclude $triedPorts
+        if ($null -eq $next) { Write-Output "    No other free port available"; $script:AgentInstallOk = $false; return }
+        if (-not (Set-AgentGrpcPort -ConfigPath $installedYml -Port $next)) { $script:AgentInstallOk = $false; return }
+        Write-Output "$(Get-FormattedDate) Switching the agent to local port $next and restarting it"
+        $port = $next
+        $triedPorts += $next
+    }
+    $script:AgentInstallOk = $false; return
+}
+
 #Function to deploy Elastic Agent
 function Install-ElasticAgent {
     param (
@@ -1663,33 +1947,21 @@ function Install-ElasticAgent {
                 # Insalling UNS SIEM Agent
                 # The installer's progress spinner is captured to files and printed afterwards without the
                 # spinner, so the real error is not buried in (or cut off from) the NinjaOne output.
-                $installOutFile = Join-Path $env:TEMP "uns-elastic-install-out.txt"
-                $installErrFile = Join-Path $env:TEMP "uns-elastic-install-err.txt"
-                Remove-Item -Path $installOutFile, $installErrFile -Force -ErrorAction SilentlyContinue
-                $process = Start-Process -FilePath "$agentinstallPath\elastic-agent.exe" -ArgumentList $arguments -NoNewWindow -PassThru -RedirectStandardOutput $installOutFile -RedirectStandardError $installErrFile
-                $handle = $process.Handle  # Cache the process handle
-                $process.WaitForExit()
-                    Write-Output "$(Get-FormattedDate) elastic-agent install finished with exit code $($process.ExitCode). Installer output:"
-                    Format-ElasticInstallOutput $installOutFile
-                    if ((Test-Path $installErrFile) -and ((Get-Item $installErrFile).Length -gt 0)) {
-                        Write-Output "    Installer error output:"
-                        Format-ElasticInstallOutput $installErrFile
-                    }
-                    Remove-Item -Path $installOutFile, $installErrFile -Force -ErrorAction SilentlyContinue
-                    # Check the exit code
-                    if ($process.ExitCode -ne 0) {
-                        throw "Installation failed with exit code $($process.ExitCode)"
-                    } else {
-                        Write-Verbose -Message "$(Get-FormattedDate) Elastic Agent has been installed."
-                    }
+                # Port pre-check, install, and recovery (alternative port + elastic-agent.yml edit + retry)
+                # when the service dies after it starts: see Invoke-ElasticAgentInstallWithRecovery.
+                $script:AgentInstallOk = $false
+                Invoke-ElasticAgentInstallWithRecovery -PackageDir $agentinstallPath -BaseArguments $arguments
+                if (-not $script:AgentInstallOk) {
+                    throw "Installation failed after recovery attempts"
+                }
+                Write-Verbose -Message "$(Get-FormattedDate) Elastic Agent has been installed."
                 }
                 catch {
                     $errorMessage = $_.Exception.Message
                     Write-Output "$(Get-FormattedDate) Installation failed because of $($errorMessage)"
-                    exit
+                    $script:deployExitCode = 1
+                    exit 1
                 }
-                # destroy the handle cache
-                $null = $handle
 
                 #Sleep 3 seconds before attempting to stop services.
                 Start-Sleep -Seconds 3
@@ -1765,6 +2037,7 @@ function Install-ElasticAgent {
 }
 
 ### ACTION ###
+$script:deployExitCode = 0
 try {
     
     if (Get-Service -Name Perch*) {
@@ -1836,6 +2109,6 @@ finally {
     $datapath = $null 
     $agentFiles = $null
     Start-Sleep 5
-    exit
+    exit $script:deployExitCode
 }
 ### END ACTION ###
